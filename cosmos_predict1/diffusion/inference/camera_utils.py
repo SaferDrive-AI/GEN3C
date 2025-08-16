@@ -345,3 +345,113 @@ def align_depth(
         return source_depth * sc_map
     else:
         raise ValueError(f"Unsupported alignment method: {alignment_method}")
+
+
+def generate_frame_trajectory(
+    original_w2c: torch.Tensor,
+    original_intrinsics: torch.Tensor,
+    trajectory_type: str,
+    movement_distance: float,
+    camera_rotation: str = "no_rotation",
+    device: str = "cuda",
+):
+    """
+    Generate new camera parameters for a single frame with viewpoint shift.
+    
+    This function differs from generate_camera_trajectory in that it:
+    1. Operates on a single frame rather than generating a full trajectory
+    2. Preserves the original camera's orientation while adding positional offset
+    3. Is designed for frame-by-frame video processing
+    
+    Args:
+        original_w2c: Original world-to-camera matrix [4, 4]
+        original_intrinsics: Original camera intrinsics [3, 3]
+        trajectory_type: Type of movement ("left", "right", "up", "down", "zoom_in", "zoom_out")
+        movement_distance: Distance of movement
+        camera_rotation: How to handle rotation ("no_rotation", "center_facing", "trajectory_aligned")
+        device: Computation device
+        
+    Returns:
+        new_w2c: New world-to-camera matrix [4, 4]
+        new_intrinsics: New camera intrinsics [3, 3] (unchanged)
+    """
+    original_w2c = original_w2c.to(device)
+    original_intrinsics = original_intrinsics.to(device)
+    
+    # Extract original camera rotation and position
+    original_rotation = original_w2c[:3, :3]
+    original_position = original_w2c[:3, 3]
+    
+    # Calculate offset based on trajectory type
+    if trajectory_type == "left":
+        offset = torch.tensor([-movement_distance, 0, 0], device=device)
+    elif trajectory_type == "right":
+        offset = torch.tensor([movement_distance, 0, 0], device=device)
+    elif trajectory_type == "up":
+        offset = torch.tensor([0, -movement_distance, 0], device=device)
+    elif trajectory_type == "down":
+        offset = torch.tensor([0, movement_distance, 0], device=device)
+    elif trajectory_type == "zoom_in":
+        offset = torch.tensor([0, 0, -movement_distance], device=device)
+    elif trajectory_type == "zoom_out":
+        offset = torch.tensor([0, 0, movement_distance], device=device)
+    elif trajectory_type == "clockwise":
+        # For circular motion, we need more complex logic
+        # For now, implement as right movement
+        offset = torch.tensor([movement_distance, 0, 0], device=device)
+    elif trajectory_type == "counterclockwise":
+        # For circular motion, we need more complex logic
+        # For now, implement as left movement  
+        offset = torch.tensor([-movement_distance, 0, 0], device=device)
+    else:
+        offset = torch.zeros(3, device=device)
+    
+    # Apply offset in camera coordinate system
+    if camera_rotation == "no_rotation":
+        # Simple translation in camera space
+        world_offset = original_rotation.T @ offset
+        new_position = original_position - world_offset
+        new_rotation = original_rotation
+    elif camera_rotation == "center_facing":
+        # Apply translation and then make camera look at original center
+        world_offset = original_rotation.T @ offset
+        new_position = original_position - world_offset
+        
+        # Calculate new rotation to look at original camera position
+        forward = (original_position - new_position).float()
+        forward = forward / torch.norm(forward)
+        
+        up = torch.tensor([0.0, 1.0, 0.0], device=device)
+        right = torch.cross(up, forward)
+        right = right / torch.norm(right)
+        up = torch.cross(forward, right)
+        
+        new_rotation = torch.stack([right, up, forward], dim=0)
+    elif camera_rotation == "trajectory_aligned":
+        # Apply translation and align camera direction with movement
+        world_offset = original_rotation.T @ offset
+        new_position = original_position - world_offset
+        
+        # Align forward direction with movement direction
+        movement_dir = world_offset / torch.norm(world_offset)
+        up = torch.tensor([0.0, 1.0, 0.0], device=device)
+        right = torch.cross(up, movement_dir)
+        right = right / torch.norm(right)
+        up = torch.cross(movement_dir, right)
+        
+        new_rotation = torch.stack([right, up, movement_dir], dim=0)
+    else:
+        # Default: no rotation
+        world_offset = original_rotation.T @ offset
+        new_position = original_position - world_offset
+        new_rotation = original_rotation
+    
+    # Construct new w2c matrix
+    new_w2c = torch.eye(4, device=device)
+    new_w2c[:3, :3] = new_rotation
+    new_w2c[:3, 3] = new_position
+    
+    # Intrinsics remain unchanged
+    new_intrinsics = original_intrinsics.clone()
+    
+    return new_w2c, new_intrinsics

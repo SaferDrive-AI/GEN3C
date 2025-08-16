@@ -182,6 +182,88 @@ def load_data_packaged_format(pt_path):
     return data
 
 
+def load_data_vipe_format(data_dir):
+    """Load data from ViPE output format"""
+    data_path = Path(data_dir)
+    
+    # Load RGB from mp4
+    rgb_dir = data_path / "rgb"
+    rgb_files = list(rgb_dir.glob("*.mp4"))
+    if not rgb_files:
+        raise ValueError(f"No MP4 file found in {rgb_dir}")
+    
+    cap = cv2.VideoCapture(str(rgb_files[0]))
+    frames = []
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    cap.release()
+    
+    if not frames:
+        raise ValueError(f"No frames found in video {rgb_files[0]}")
+    
+    frames_np = np.stack(frames, axis=0)
+    image_tensor = torch.from_numpy(frames_np).permute(0, 3, 1, 2).float()
+    image_tensor = (image_tensor / 127.5) - 1.0  # [0,255] -> [-1,1]
+    
+    # For now, create dummy depth and mask data
+    # TODO: Extract and load actual depth/mask data from zip files
+    num_frames = len(frames)
+    H, W = frames[0].shape[:2]
+    depth_tensor = torch.ones(num_frames, 1, H, W) * 10.0  # Dummy depth
+    mask_tensor = torch.ones(num_frames, 1, H, W)  # Dummy mask
+    
+    # Load camera data - ViPE format uses separate intrinsics and pose files
+    intrinsics_files = list((data_path / "intrinsics").glob("*.npz"))
+    pose_files = list((data_path / "pose").glob("*.npz"))
+    
+    if not intrinsics_files or not pose_files:
+        raise ValueError("Missing intrinsics or pose files")
+    
+    # Load intrinsics
+    intrinsics_data = np.load(intrinsics_files[0])
+    intrinsics_raw = intrinsics_data['data']  # Shape: (N, 4) - fx, fy, cx, cy
+    intrinsics_inds = intrinsics_data['inds']
+    
+    # Convert to 3x3 intrinsics matrices
+    intrinsics_matrices = []
+    for i in range(num_frames):
+        if i < len(intrinsics_inds):
+            fx, fy, cx, cy = intrinsics_raw[intrinsics_inds[i]]
+        else:
+            # Use last available intrinsics
+            fx, fy, cx, cy = intrinsics_raw[intrinsics_inds[-1]]
+        
+        K = np.array([
+            [fx, 0, cx],
+            [0, fy, cy],
+            [0, 0, 1]
+        ], dtype=np.float32)
+        intrinsics_matrices.append(K)
+    
+    intrinsics_tensor = torch.from_numpy(np.stack(intrinsics_matrices, axis=0))
+    
+    # Load poses (world-to-camera matrices)
+    pose_data = np.load(pose_files[0])
+    poses_raw = pose_data['data']  # Shape: (N, 4, 4)
+    pose_inds = pose_data['inds']
+    
+    poses_matrices = []
+    for i in range(num_frames):
+        if i < len(pose_inds):
+            w2c = poses_raw[pose_inds[i]]
+        else:
+            # Use last available pose
+            w2c = poses_raw[pose_inds[-1]]
+        poses_matrices.append(w2c)
+    
+    w2c_tensor = torch.from_numpy(np.stack(poses_matrices, axis=0).astype(np.float32))
+    
+    return image_tensor, depth_tensor, mask_tensor, w2c_tensor, intrinsics_tensor
+
+
 def load_data_auto_detect(input_path):
     """Auto-detect format and load data"""
     input_path = Path(input_path)
@@ -189,6 +271,10 @@ def load_data_auto_detect(input_path):
     if input_path.is_file() and input_path.suffix == '.pt':
         return load_data_packaged_format(input_path)
     elif input_path.is_dir():
-        return load_data_distributed_format(input_path)
+        # Check if it's ViPE format (has rgb/, depth/, etc. subdirectories)
+        if (input_path / "rgb").exists() and (input_path / "intrinsics").exists():
+            return load_data_vipe_format(input_path)
+        else:
+            return load_data_distributed_format(input_path)
     else:
         raise ValueError(f"Invalid input path: {input_path}") 
